@@ -71,10 +71,6 @@ func BuildRebalanceMove(state *ClusterState, expectedShards int, maxSlots int) (
 			nonEmpty = append(nonEmpty, primaries[len(primaries)-1])
 		}
 	}
-	if len(nonEmpty) > expectedShards {
-		return nil, fmt.Errorf("too many slot-bearing primaries (%d) for expected shards %d", len(nonEmpty), expectedShards)
-	}
-
 	sort.Slice(nonEmpty, func(i, j int) bool {
 		return nonEmpty[i].node.Address < nonEmpty[j].node.Address
 	})
@@ -82,37 +78,63 @@ func BuildRebalanceMove(state *ClusterState, expectedShards int, maxSlots int) (
 		return empty[i].node.Address < empty[j].node.Address
 	})
 
-	neededEmpty := expectedShards - len(nonEmpty)
-	if neededEmpty > len(empty) {
-		return nil, nil
-	}
-	primaries = append(primaries, nonEmpty...)
-	primaries = append(primaries, empty[:neededEmpty]...)
+	scaleDown := len(nonEmpty) > expectedShards
+	var keepers []*primarySlots
+	var removals []*primarySlots
 
-	sort.Slice(primaries, func(i, j int) bool {
-		return primaries[i].node.Address < primaries[j].node.Address
-	})
+	if scaleDown {
+		keepers = append(keepers, nonEmpty[:expectedShards]...)
+		removals = append(removals, nonEmpty[expectedShards:]...)
+		primaries = append(primaries, keepers...)
+		primaries = append(primaries, removals...)
+	} else {
+		neededEmpty := expectedShards - len(nonEmpty)
+		if neededEmpty > len(empty) {
+			return nil, nil
+		}
+		primaries = append(primaries, nonEmpty...)
+		primaries = append(primaries, empty[:neededEmpty]...)
+		keepers = append(keepers, primaries...)
+	}
 
 	base := TotalSlots / expectedShards
 	remaining := TotalSlots % expectedShards
-	for i, primary := range primaries {
+	for i, primary := range keepers {
 		primary.target = base
 		if i < remaining {
 			primary.target++
 		}
 	}
+	for _, primary := range removals {
+		primary.target = 0
+	}
 
 	var src *primarySlots
 	var dst *primarySlots
-	for _, primary := range primaries {
-		if primary.count > primary.target && src == nil {
-			src = primary
+	if scaleDown {
+		for _, primary := range removals {
+			if primary.count > primary.target {
+				src = primary
+				break
+			}
 		}
-		if primary.count < primary.target && dst == nil {
-			dst = primary
+		for _, primary := range keepers {
+			if primary.count < primary.target {
+				dst = primary
+				break
+			}
 		}
-		if src != nil && dst != nil {
-			break
+	} else {
+		for _, primary := range primaries {
+			if primary.count > primary.target && src == nil {
+				src = primary
+			}
+			if primary.count < primary.target && dst == nil {
+				dst = primary
+			}
+			if src != nil && dst != nil {
+				break
+			}
 		}
 	}
 

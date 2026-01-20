@@ -50,6 +50,33 @@ func TestBuildRebalanceMove_ScaleOut(t *testing.T) {
 	}
 }
 
+func TestBuildRebalanceMove_ScaleDown(t *testing.T) {
+	state := &ClusterState{
+		Shards: []*ShardState{
+			newPrimaryShard("10.0.0.1", "node-1", []SlotsRange{{Start: 0, End: 5460}}),
+			newPrimaryShard("10.0.0.2", "node-2", []SlotsRange{{Start: 5461, End: 10921}}),
+			newPrimaryShard("10.0.0.3", "node-3", []SlotsRange{{Start: 10922, End: 16383}}),
+		},
+	}
+
+	move, err := BuildRebalanceMove(state, 2, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if move == nil {
+		t.Fatalf("expected move, got nil")
+	}
+	if move.Src.Address != "10.0.0.3" || move.Dst.Address != "10.0.0.1" {
+		t.Fatalf("unexpected src/dst: %s -> %s", move.Src.Address, move.Dst.Address)
+	}
+	if len(move.Slots) != 20 {
+		t.Fatalf("expected 20 slots, got %d", len(move.Slots))
+	}
+	if move.Slots[0] != 10922 {
+		t.Fatalf("unexpected first slot: %d", move.Slots[0])
+	}
+}
+
 func TestBuildRebalanceMove_Balanced(t *testing.T) {
 	state := &ClusterState{
 		Shards: []*ShardState{

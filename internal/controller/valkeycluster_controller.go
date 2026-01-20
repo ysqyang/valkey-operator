@@ -67,6 +67,7 @@ var scripts embed.FS
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="apps",resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -150,6 +151,26 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
+	expectedNodes := int(cluster.Spec.Shards) * (1 + int(cluster.Spec.Replicas))
+	if expectedNodes > 0 && len(pods.Items) > expectedNodes && scaleDownActive(state, int(cluster.Spec.Shards)) {
+		changed, err := r.scaleDownShards(ctx, cluster, state, pods)
+		if err != nil {
+			log.Error(err, "scale down failed")
+			r.Recorder.Eventf(cluster, corev1.EventTypeWarning, "ScaleDownFailed", "Scale down failed: %v", err)
+			setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonRebalanceFailed, err.Error(), metav1.ConditionTrue)
+			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
+			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonReconciling, "Scaling down shards", metav1.ConditionTrue)
+			_ = r.updateStatus(ctx, cluster, state)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		if changed || scaleDownActive(state, int(cluster.Spec.Shards)) {
+			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
+			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonReconciling, "Scaling down shards", metav1.ConditionTrue)
+			_ = r.updateStatus(ctx, cluster, state)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+
 	replicaAttached, err := r.attachReplica(ctx, cluster, state)
 	if err != nil {
 		log.Error(err, "unable to add cluster replica")
@@ -179,6 +200,21 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			_ = r.updateStatus(ctx, cluster, state)
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
+	}
+
+	extraReplicaRemoved, err := r.removeExtraReplicas(ctx, cluster, state, pods)
+	if err != nil {
+		log.Error(err, "unable to remove extra replicas")
+		r.Recorder.Eventf(cluster, corev1.EventTypeWarning, "ReplicaRemovalFailed", "Failed to remove replica: %v", err)
+		setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonNodeAddFailed, err.Error(), metav1.ConditionTrue)
+		_ = r.updateStatus(ctx, cluster, state)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	if extraReplicaRemoved {
+		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
+		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonReconciling, "Removing extra replicas", metav1.ConditionTrue)
+		_ = r.updateStatus(ctx, cluster, state)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	// Check if all slots are assigned
