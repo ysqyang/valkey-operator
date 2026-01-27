@@ -73,6 +73,10 @@ func (r *ValkeyClusterReconciler) rebalanceSlots(ctx context.Context, cluster *v
 
 	ranges := slotsToRanges(move.Slots)
 	if err := migrateSlotsAtomic(ctx, move.Src, move.Dst, ranges); err != nil {
+		if isSlotsNotServedByNode(err) {
+			log.V(1).Info("slots no longer served by source; will retry with fresh state", "src", move.Src.Address, "dst", move.Dst.Address)
+			return true, nil
+		}
 		if !isAtomicMigrationUnsupported(err) {
 			return false, err
 		}
@@ -235,4 +239,11 @@ func isAtomicMigrationUnsupported(err error) bool {
 		strings.Contains(msg, "syntax error") ||
 		strings.Contains(msg, "wrong number of arguments") ||
 		strings.Contains(msg, "not supported")
+}
+
+func isSlotsNotServedByNode(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "slots are not served by this node")
 }
