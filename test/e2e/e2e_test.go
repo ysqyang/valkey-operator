@@ -440,28 +440,28 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyClusterAccess).Should(Succeed())
 		})
 
-	It("rebalances slots on scale out", func() {
-		const baseShards = 2
-		const scaleOutShards = 3
-		valkeyClusterName = "valkeycluster-scaleout"
+		It("rebalances slots on scale out", func() {
+			const baseShards = 2
+			const scaleOutShards = 3
+			valkeyClusterName = "valkeycluster-scaleout"
 
-		By("ensuring the controller pod name is set")
-		cmd := exec.Command("kubectl", "get",
-			"pods", "-l", "control-plane=controller-manager",
-			"-o", "go-template={{ range .items }}"+
-				"{{ if not .metadata.deletionTimestamp }}"+
-				"{{ .metadata.name }}"+
-				"{{ \"\\n\" }}{{ end }}{{ end }}",
-			"-n", namespace,
-		)
-		podOutput, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-		podNames := utils.GetNonEmptyLines(podOutput)
-		Expect(podNames).NotTo(BeEmpty(), "expected a controller pod running")
-		controllerPodName = podNames[0]
+			By("ensuring the controller pod name is set")
+			cmd := exec.Command("kubectl", "get",
+				"pods", "-l", "control-plane=controller-manager",
+				"-o", "go-template={{ range .items }}"+
+					"{{ if not .metadata.deletionTimestamp }}"+
+					"{{ .metadata.name }}"+
+					"{{ \"\\n\" }}{{ end }}{{ end }}",
+				"-n", namespace,
+			)
+			podOutput, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
+			podNames := utils.GetNonEmptyLines(podOutput)
+			Expect(podNames).NotTo(BeEmpty(), "expected a controller pod running")
+			controllerPodName = podNames[0]
 
-		By("creating a smaller ValkeyCluster for scale-out")
-		scaleOutManifest := fmt.Sprintf(`apiVersion: valkey.io/v1alpha1
+			By("creating a smaller ValkeyCluster for scale-out")
+			scaleOutManifest := fmt.Sprintf(`apiVersion: valkey.io/v1alpha1
 kind: ValkeyCluster
 metadata:
   name: %s
@@ -545,10 +545,85 @@ spec:
 		}
 		Eventually(verifyScaledOut, 10*time.Minute, 2*time.Second).Should(Succeed())
 
-		By("cleaning up the scale-out cluster")
-		cmd = exec.Command("kubectl", "delete", "valkeycluster", valkeyClusterName, "--wait=false")
-		_, _ = utils.Run(cmd)
-	})
+			By("cleaning up the scale-out cluster")
+			cmd = exec.Command("kubectl", "delete", "valkeycluster", valkeyClusterName, "--wait=false")
+			_, _ = utils.Run(cmd)
+		})
+
+		It("rebalances slots on scale down", func() {
+			const baseShards = 2
+			const scaleDownShards = 1
+			valkeyClusterName = "valkeycluster-scaledown"
+
+			By("creating a smaller ValkeyCluster for scale-down")
+			scaleDownManifest := fmt.Sprintf(`apiVersion: valkey.io/v1alpha1
+kind: ValkeyCluster
+metadata:
+  name: %s
+spec:
+  shards: %d
+  replicas: 1
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+`, valkeyClusterName, baseShards)
+			manifestFile := filepath.Join(os.TempDir(), "valkeycluster-scaledown.yaml")
+			err := os.WriteFile(manifestFile, []byte(scaleDownManifest), 0644)
+			Expect(err).NotTo(HaveOccurred(), "Failed to write scale-down manifest file")
+			defer os.Remove(manifestFile)
+
+			cmd := exec.Command("kubectl", "delete", "valkeycluster", valkeyClusterName, "--ignore-not-found=true")
+			_, _ = utils.Run(cmd)
+			cmd = exec.Command("kubectl", "apply", "-f", manifestFile)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply scale-down ValkeyCluster CR")
+
+			By(fmt.Sprintf("scaling the cluster down to %d shards", scaleDownShards))
+			cmd = exec.Command("kubectl", "patch", "valkeycluster", valkeyClusterName,
+				"--type=merge", "-p", fmt.Sprintf(`{"spec":{"shards":%d}}`, scaleDownShards))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to patch ValkeyCluster shards")
+
+			By("verifying only the expected primaries keep slots after scale down")
+			verifySlotRebalance := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pods",
+					"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", valkeyClusterName),
+					"-o", "jsonpath={.items[0].metadata.name}")
+				podName, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(podName)).NotTo(BeEmpty(), "Expected a valkey pod")
+
+				cmd = exec.Command("kubectl", "exec", strings.TrimSpace(podName), "--",
+					"valkey-cli", "-c", "-h", "127.0.0.1", "CLUSTER", "NODES")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+
+				lines := utils.GetNonEmptyLines(output)
+				masterWithSlots := 0
+				for _, line := range lines {
+					fields := strings.Fields(line)
+					if len(fields) < 9 {
+						continue
+					}
+					if !strings.Contains(fields[2], "master") {
+						continue
+					}
+					if len(fields) > 8 {
+						masterWithSlots++
+					}
+				}
+				g.Expect(masterWithSlots).To(Equal(scaleDownShards), "Expected only desired primaries to own slots after scale down")
+			}
+			Eventually(verifySlotRebalance, 10*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("cleaning up the scale-down cluster")
+			cmd = exec.Command("kubectl", "delete", "valkeycluster", valkeyClusterName, "--wait=false")
+			_, _ = utils.Run(cmd)
+		})
 	})
 
 	Context("when a ValkeyCluster CR is deleted", func() {
