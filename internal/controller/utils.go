@@ -23,7 +23,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	valkeyv1 "valkey.io/valkey-operator/api/v1alpha1"
-	"valkey.io/valkey-operator/internal/valkey"
 )
 
 const appName = "valkey"
@@ -126,18 +125,4 @@ func primaryPodIP(pods *corev1.PodList, shardIndex int) string {
 		return ""
 	}
 	return pods.Items[idx].Status.PodIP
-}
-
-// pickPendingNode selects the next pending node to process, prioritizing
-// primaries (node index 0) over replicas. This ensures primaries get slots
-// before replicas try to attach, since CLUSTER REPLICATE needs the primary
-// to already be in state.Shards.
-func pickPendingNode(nodes []*valkey.NodeState, pods *corev1.PodList) *valkey.NodeState {
-	for _, n := range nodes {
-		role, _ := podRoleAndShard(n.Address, pods)
-		if role == RolePrimary {
-			return n
-		}
-	}
-	return nodes[0]
 }
