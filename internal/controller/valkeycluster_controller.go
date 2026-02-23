@@ -139,11 +139,11 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// --- Phase 1: MEET all isolated nodes in one batch ---
 	// A node with cluster_known_nodes <= 1 hasn't been introduced to the
 	// cluster yet. CLUSTER MEET is idempotent and has no ordering
-	// dependencies, so we issue it for every isolated node in a single
-	// reconcile pass — this includes both pending nodes AND shard primaries
-	// that were assigned slots while still isolated. After MEET, we requeue
-	// to let gossip propagate before proceeding to slot assignment or
-	// replication.
+	// dependencies, so we issue it for every isolated pending node in a
+	// single reconcile pass. Phase 2 refuses to assign slots to isolated
+	// nodes, so every node is guaranteed to pass through here first.
+	// After MEET, we requeue to let gossip propagate before proceeding
+	// to slot assignment or replication.
 	{
 		met, err := r.meetIsolatedNodes(ctx, cluster, state)
 		if err != nil {
@@ -184,7 +184,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// --- Phase 3: REPLICATE all replica-labeled pending nodes ---
-	// By this point all primaries have slots and appear in state.Shards.
+	// By this point all currently known primaries have slots and appear in state.Shards.
 	// CLUSTER REPLICATE for different replicas targets different primaries,
 	// so they can all be issued in one pass.
 	if len(state.PendingNodes) > 0 {
@@ -422,6 +422,25 @@ func (r *ValkeyClusterReconciler) getValkeyClusterState(ctx context.Context, pod
 	return valkey.GetClusterState(ctx, ips, DefaultPort)
 }
 
+// findMeetTarget picks the best node to MEET all isolated nodes against.
+// Priority: (1) a non-isolated shard primary — already has slots, so gossip
+// will propagate slot info; (2) a non-isolated pending node from a previous
+// MEET batch; (3) the first isolated node as a bootstrap seed when every
+// single node is isolated (fresh bootstrap, first reconcile).
+func findMeetTarget(state *valkey.ClusterState, isolated []*valkey.NodeState) *valkey.NodeState {
+	for _, shard := range state.Shards {
+		if p := shard.GetPrimaryNode(); p != nil && !p.IsIsolated() {
+			return p
+		}
+	}
+	for _, node := range state.PendingNodes {
+		if !node.IsIsolated() {
+			return node
+		}
+	}
+	return isolated[0]
+}
+
 // meetIsolatedNodes issues CLUSTER MEET for every isolated pending node
 // (cluster_known_nodes <= 1). Phase 2 (assignSlotsToPendingPrimaries)
 // refuses to assign slots to isolated nodes, so every node is guaranteed
@@ -452,35 +471,11 @@ func (r *ValkeyClusterReconciler) meetIsolatedNodes(ctx context.Context, cluster
 		return 0, nil
 	}
 
-	// Find a well-connected node (cluster_known_nodes > 1) to use as the
-	// MEET target. We check shard primaries first (they already have slots,
-	// so gossip will propagate slot info), then fall back to any
-	// non-isolated pending node (from a previous MEET batch that hasn't
-	// received slots yet). Only if every single node is isolated (true
-	// fresh bootstrap, first reconcile) do we pick an isolated node as a
-	// bootstrap seed.
-	var meetTarget *valkey.NodeState
-	for _, shard := range state.Shards {
-		p := shard.GetPrimaryNode()
-		if p != nil && !p.IsIsolated() {
-			meetTarget = p
-			break
-		}
-	}
-	if meetTarget == nil {
-		for _, node := range state.PendingNodes {
-			if !node.IsIsolated() {
-				meetTarget = node
-				break
-			}
-		}
-	}
-
-	if meetTarget == nil {
-		// Every node is isolated (true fresh bootstrap). Use the first
-		// isolated node as a bootstrap seed: every other node MEETs it,
-		// and gossip takes care of full propagation.
-		meetTarget = isolated[0]
+	// Find a well-connected node to MEET all isolated nodes against.
+	// Falls back to an isolated node as a bootstrap seed if every node
+	// is isolated (fresh bootstrap).
+	meetTarget := findMeetTarget(state, isolated)
+	if meetTarget == isolated[0] {
 		isolated = isolated[1:]
 	}
 
@@ -619,8 +614,6 @@ func (r *ValkeyClusterReconciler) replicatePendingReplicas(ctx context.Context, 
 			}
 			log.V(1).Info("post-failover: attaching replacement node as replica",
 				"shardIndex", shardIndex, "node", node.Address)
-		} else if role != RoleReplica {
-			continue
 		}
 
 		if err := r.replicateToShardPrimary(ctx, cluster, state, node, shardIndex, pods); err != nil {
