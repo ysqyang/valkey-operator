@@ -103,6 +103,25 @@ func GetClusterState(ctx context.Context, addresses []string, port int) *Cluster
 			}
 		}
 	}
+
+	// A slot-less master goes to PendingNodes above, but its replica
+	// (already CLUSTER REPLICATE'd) is a slave and lands in Shards by
+	// shard ID.  Reunite them: move any pending node whose shard already
+	// exists into that shard so the data model stays consistent.
+	var stillPending []*NodeState
+	for _, node := range state.PendingNodes {
+		idx := slices.IndexFunc(state.Shards, func(s *ShardState) bool { return s.Id == node.ShardId })
+		if idx >= 0 {
+			state.Shards[idx].Nodes = append(state.Shards[idx].Nodes, node)
+			if node.IsPrimary() {
+				state.Shards[idx].PrimaryId = node.Id
+			}
+		} else {
+			stillPending = append(stillPending, node)
+		}
+	}
+	state.PendingNodes = stillPending
+
 	return &state
 }
 
