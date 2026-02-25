@@ -3,8 +3,8 @@ kind: ValkeyCluster
 metadata:
   name: valkeycluster-sample
 spec:
-  shards: 3
-  replicas: 1
+  shards: 5
+  replicas: 3
   resources:
     requests:
       memory: "256Mi"

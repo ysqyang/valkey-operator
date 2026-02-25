@@ -979,6 +979,7 @@ spec:
                 description: Metrics exporter options
                 properties:
                   enabled:
+                    default: true
                     description: Enable or disable the exporter sidecar container
                     type: boolean
                   image:
