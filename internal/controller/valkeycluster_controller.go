@@ -561,13 +561,14 @@ func (r *ValkeyClusterReconciler) assignSlotsToPendingPrimaries(ctx context.Cont
 		}
 
 		slotStart := slots[0].Start
-		base := valkey.TotalSlots / shardsRequired
-		idx := shardsExists + assigned
-		perShard := base
-		if idx < valkey.TotalSlots%shardsRequired {
-			perShard++
+		numSlotsPerShard := valkey.TotalSlots / shardsRequired
+		shardIdx := shardsExists + assigned
+		// Distribute the remainder evenly: the first (TotalSlots % shardsRequired)
+		// shards each get one extra slot.
+		if shardIdx < valkey.TotalSlots%shardsRequired {
+			numSlotsPerShard++
 		}
-		slotEnd := slotStart + perShard - 1
+		slotEnd := slotStart + numSlotsPerShard - 1
 
 		log.V(1).Info("assign slots to primary", "node", node.Address, "slotStart", slotStart, "slotEnd", slotEnd)
 		if err := node.Client.Do(ctx, node.Client.B().ClusterAddslotsrange().StartSlotEndSlot().StartSlotEndSlot(int64(slotStart), int64(slotEnd)).Build()).Error(); err != nil {
