@@ -157,6 +157,8 @@ const (
 	ReasonNoSlots           = "NoSlotsAvailable"
 	ReasonRebalancingSlots  = "RebalancingSlots"
 	ReasonRebalanceFailed   = "RebalanceFailed"
+	ReasonDrainingSlots     = "DrainingSlots"
+	ReasonDrainFailed       = "DrainFailed"
 )
 
 // +kubebuilder:object:root=true

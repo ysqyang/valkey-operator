@@ -88,9 +88,12 @@ var scripts embed.FS
 //     primary-labeled pending nodes via CLUSTER ADDSLOTSRANGE.
 //  8. Phase 3 – Replicate: batch-attach all replica-labeled pending nodes
 //     to their matching primaries via CLUSTER REPLICATE.
-//  9. Verify that the expected number of shards and replicas exist.
-//  10. Verify that all 16384 hash slots are assigned.
-//  11. If everything is healthy, mark the cluster Ready and requeue after 30s
+//  9. Scale-down: if the cluster has more shards than desired, drain slots
+//     from excess shards via CLUSTER MIGRATESLOTS and delete their
+//     Deployments once fully drained.
+//  10. Verify that the expected number of shards and replicas exist.
+//  11. Verify that all 16384 hash slots are assigned.
+//  12. If everything is healthy, mark the cluster Ready and requeue after 30s
 //     for periodic health checks.
 //
 // For more details, check Reconcile and its Result here:
@@ -209,6 +212,38 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// them from unreplicated replicas. We use pod labels to identify them
 	// and include them as empty shards for health checks and rebalancing.
 	allShards := effectiveShards(state, pods)
+
+	// Handle scale-down: drain excess shards before health checks.
+	if len(state.Shards) > int(cluster.Spec.Shards) {
+		drained, err := r.drainExcessShards(ctx, cluster, state, pods)
+		if err != nil {
+			log.Error(err, "scale-down draining failed")
+			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "DrainFailed", "ScaleDown", "Failed to drain excess shards: %v", err)
+			setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonDrainFailed, err.Error(), metav1.ConditionTrue)
+			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Scaling down cluster", metav1.ConditionFalse)
+			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonDrainingSlots, "Draining slots from excess shards", metav1.ConditionTrue)
+			_ = r.updateStatus(ctx, cluster, state)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		if drained {
+			meta.RemoveStatusCondition(&cluster.Status.Conditions, valkeyiov1alpha1.ConditionDegraded)
+			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Scaling down cluster", metav1.ConditionFalse)
+			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonDrainingSlots, "Draining slots from excess shards", metav1.ConditionTrue)
+			_ = r.updateStatus(ctx, cluster, state)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+
+	// Clean up leftover deployments from a previous scale-down where drained
+	// primaries became replicas before their deployments could be deleted.
+	// At this point state.Shards <= spec.Shards, so any pods with
+	// shard-index >= spec.Shards are slot-less and safe to remove.
+	if cleaned, err := r.deleteExcessDeployments(ctx, cluster); err != nil {
+		log.Error(err, "failed to delete excess deployments")
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	} else if cleaned {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 
 	// Check cluster status
 	if len(allShards) < int(cluster.Spec.Shards) {
