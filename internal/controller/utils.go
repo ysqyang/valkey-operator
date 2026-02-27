@@ -190,3 +190,11 @@ func findShardPrimary(state *valkey.ClusterState, shardIndex int, pods *corev1.P
 	}
 	return "", ""
 }
+
+func countSlots(ranges []valkey.SlotsRange) int {
+	count := 0
+	for _, slot := range ranges {
+		count += slot.End - slot.Start + 1
+	}
+	return count
+}
