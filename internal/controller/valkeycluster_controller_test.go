@@ -944,14 +944,19 @@ var _ = Describe("reconcileValkeyNodes", func() {
 		return node.Spec.Image
 	}
 
-	// reconcileNodes lists the current ValkeyNodes and calls reconcileValkeyNodes.
-	reconcileNodes := func() (bool, error) {
+	reconcileNodesWithOptions := func(options reconcileValkeyNodesOptions) (bool, error) {
 		GinkgoHelper()
 		nodeList := &valkeyiov1alpha1.ValkeyNodeList{}
 		Expect(k8sClient.List(testCtx, nodeList,
 			client.InNamespace("default"),
 			client.MatchingLabels{LabelCluster: clusterName})).To(Succeed())
-		return r.reconcileValkeyNodes(testCtx, cluster, nodeList, "")
+		return r.reconcileValkeyNodesWithOptions(testCtx, cluster, nodeList, "", options)
+	}
+
+	// reconcileNodes lists the current ValkeyNodes and calls reconcileValkeyNodes.
+	reconcileNodes := func() (bool, error) {
+		GinkgoHelper()
+		return reconcileNodesWithOptions(reconcileValkeyNodesOptions{AllowSpecUpdates: true})
 	}
 
 	// createAllNodes runs a single reconcile that creates all 4 ValkeyNode CRs.
@@ -1091,6 +1096,33 @@ var _ = Describe("reconcileValkeyNodes", func() {
 		Expect(requeue).To(BeTrue())
 		Expect(getImage(node00)).To(Equal("valkey/valkey:9.1.0"))
 	})
+
+	It("creates missing nodes but skips existing spec updates when topology owns the operation", func() {
+		By("creating all nodes and marking them ready")
+		createAllNodes()
+		markAllReady()
+
+		By("changing topology and image at the same time")
+		const newImage = "valkey/valkey:9.1.0"
+		cluster.Spec.Shards = 3
+		cluster.Spec.Image = newImage
+
+		By("reconciling with spec updates blocked")
+		requeue, err := reconcileNodesWithOptions(reconcileValkeyNodesOptions{AllowSpecUpdates: false})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(requeue).To(BeFalse(), "missing ValkeyNodes should be created in the same pass")
+
+		By("verifying existing nodes were not rolled")
+		for _, name := range allNodes {
+			Expect(getImage(name)).To(Equal("valkey/valkey:9.0.0"),
+				"existing node %s must keep its old image while topology owns the operation", name)
+		}
+
+		By("verifying the new shard nodes were created with the new desired spec")
+		for _, name := range []string{valkeyNodeName(clusterName, 2, 0), valkeyNodeName(clusterName, 2, 1)} {
+			Expect(getImage(name)).To(Equal(newImage), "new node %s should use the current desired spec", name)
+		}
+	})
 })
 
 var _ = Describe("reconcileValkeyNode", func() {
@@ -1151,8 +1183,13 @@ var _ = Describe("reconcileValkeyNode", func() {
 		Expect(k8sClient.Status().Update(testCtx, node)).To(Succeed())
 	}
 
+	reconcileNode := func() (nodeResult, error) {
+		GinkgoHelper()
+		return r.reconcileValkeyNodeWithOptions(testCtx, cluster, shardIndex, nodeIndex, nil, "", reconcileValkeyNodesOptions{AllowSpecUpdates: true})
+	}
+
 	It("creates the ValkeyNode and emits ValkeyNodeCreated event", func() {
-		result, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		result, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(nodeCreated))
 
@@ -1162,12 +1199,12 @@ var _ = Describe("reconcileValkeyNode", func() {
 	})
 
 	It("updates the ValkeyNode spec, emits ValkeyNodeUpdated event, and signals requeue", func() {
-		_, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		_, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		collectEvents(fakeRecorder) // drain creation event
 
 		cluster.Spec.Image = "valkey/valkey:9.1.0"
-		result, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		result, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(nodeRequeued))
 
@@ -1176,31 +1213,31 @@ var _ = Describe("reconcileValkeyNode", func() {
 	})
 
 	It("signals requeue when node is unchanged but not yet ready", func() {
-		_, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		_, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		collectEvents(fakeRecorder) // drain creation event
 
 		// Status.Ready defaults to false after creation
-		result, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		result, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(nodeRequeued))
 	})
 
 	It("does not requeue when node is unchanged and ready", func() {
-		_, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		_, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		collectEvents(fakeRecorder) // drain creation event
 
 		setNodeReady(true)
 
-		result, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		result, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(nodeUnchanged))
 	})
 
 	It("signals requeue when node is unchanged but ObservedGeneration is stale", func() {
 		// Create the node
-		_, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		_, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 
 		// Mark ready but leave ObservedGeneration at 0
@@ -1215,7 +1252,7 @@ var _ = Describe("reconcileValkeyNode", func() {
 		// Because ObservedGeneration > 0 guard: newly created node with
 		// ObservedGeneration=0 falls through to the Ready check, which
 		// passes (Ready=true). No requeue.
-		result, err := r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		result, err := reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(nodeUnchanged))
 
@@ -1230,13 +1267,13 @@ var _ = Describe("reconcileValkeyNode", func() {
 
 		// Change cluster spec to trigger an update on next reconcile
 		cluster.Spec.Image = "valkey/valkey:9.1.0"
-		result, err = r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		result, err = reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(nodeRequeued), "should requeue after updating node")
 
 		// Next reconcile: spec matches (OperationResultNone), but
 		// Generation (2) != ObservedGeneration (1) — must requeue.
-		result, err = r.reconcileValkeyNode(testCtx, cluster, shardIndex, nodeIndex, nil, "")
+		result, err = reconcileNode()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(nodeRequeued), "should requeue while ObservedGeneration is stale")
 	})

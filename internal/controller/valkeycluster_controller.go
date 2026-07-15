@@ -179,7 +179,24 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	if requeue, err := r.reconcileValkeyNodes(ctx, cluster, nodes, configHash); err != nil {
+	if syncActiveOperation(cluster, desiredClusterOperation(cluster, nodes, configHash)) {
+		if err := r.updateStatus(ctx, cluster, nil); err != nil {
+			log.Error(err, statusUpdateFailedMsg)
+			return ctrl.Result{}, err
+		}
+	}
+
+	allowSpecUpdates := activeOperationAllowsSpecUpdates(cluster)
+	if active := cluster.Status.ActiveOperation; active != nil && !allowSpecUpdates {
+		switch active.Type {
+		case valkeyiov1alpha1.OperationScaleOut:
+			setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseCreatingNodes, "Reconciling topology before pod rolls")
+		case valkeyiov1alpha1.OperationScaleIn:
+			setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseDrainingSlots, "Reconciling topology before pod rolls")
+		}
+	}
+
+	if requeue, err := r.reconcileValkeyNodesWithOptions(ctx, cluster, nodes, configHash, reconcileValkeyNodesOptions{AllowSpecUpdates: allowSpecUpdates}); err != nil {
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonValkeyNodeError, err.Error(), metav1.ConditionFalse)
 		_ = r.updateStatus(ctx, cluster, nil)
 		return ctrl.Result{}, err
@@ -190,6 +207,9 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		} else if handled {
 			return result, nil
+		}
+		if active := cluster.Status.ActiveOperation; active != nil && active.Type == valkeyiov1alpha1.OperationRollingUpdate {
+			setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseRollingNodes, "Updating ValkeyNodes")
 		}
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonUpdatingNodes, "Updating ValkeyNodes", metav1.ConditionFalse)
 		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonUpdatingNodes, "Updating ValkeyNodes", metav1.ConditionTrue)
@@ -231,6 +251,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		if met > 0 {
 			r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ClusterMeetBatch", "ClusterMeet", "Introduced %d isolated node(s) to the cluster", met)
+			setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseJoiningNodes, "Introducing nodes to cluster")
 			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonAddingNodes, "Introducing nodes to cluster", metav1.ConditionTrue)
 			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
 			_ = r.updateStatus(ctx, cluster, state)
@@ -252,6 +273,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		if assigned > 0 {
 			r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "PrimariesCreated", "AssignSlots", "Assigned slots to %d new primary node(s)", assigned)
+			setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseAssigningSlots, "Assigning slots to primaries")
 			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonAddingNodes, "Assigning slots to primaries", metav1.ConditionTrue)
 			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
 			_ = r.updateStatus(ctx, cluster, state)
@@ -274,6 +296,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		if replicated > 0 {
 			r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ReplicasAttached", "CreateReplica", "Attached %d replica node(s)", replicated)
+			setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseAttachingReplicas, "Attaching replicas")
 			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonAddingNodes, "Attaching replicas", metav1.ConditionTrue)
 			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
 			_ = r.updateStatus(ctx, cluster, state)
@@ -367,6 +390,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		log.Error(err, "slot rebalancing failed")
 		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "SlotRebalanceFailed", "RebalanceSlots", "Slot rebalancing failed: %v", err)
+		setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseRebalancingSlots, "Rebalancing slots across primaries")
 		setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonRebalanceFailed, err.Error(), metav1.ConditionTrue)
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
 		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots across primaries", metav1.ConditionTrue)
@@ -378,6 +402,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// NodeAddFailed set when replicas couldn't attach to primaries
 		// that hadn't received slots yet during scale-out).
 		meta.RemoveStatusCondition(&cluster.Status.Conditions, valkeyiov1alpha1.ConditionDegraded)
+		setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseRebalancingSlots, "Rebalancing slots across primaries")
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
 		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots across primaries", metav1.ConditionTrue)
 		_ = r.updateStatus(ctx, cluster, state)
@@ -391,6 +416,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	meta.RemoveStatusCondition(&cluster.Status.Conditions, valkeyiov1alpha1.ConditionDegraded)
 	setCondition(cluster, valkeyiov1alpha1.ConditionClusterFormed, valkeyiov1alpha1.ReasonTopologyComplete, "All nodes joined cluster", metav1.ConditionTrue)
 	setCondition(cluster, valkeyiov1alpha1.ConditionSlotsAssigned, valkeyiov1alpha1.ReasonAllSlotsAssigned, "All slots assigned", metav1.ConditionTrue)
+	clearActiveOperation(cluster)
 
 	if err := r.updateStatus(ctx, cluster, state); err != nil {
 		log.Error(err, statusUpdateFailedMsg)
@@ -502,7 +528,11 @@ func (r *ValkeyClusterReconciler) upsertService(ctx context.Context, cluster *va
 	return nil
 }
 
-// reconcileValkeyNodes ensures every (shard, nodeIndex) pair has a ValkeyNode CR.
+type reconcileValkeyNodesOptions struct {
+	AllowSpecUpdates bool
+}
+
+// reconcileValkeyNodesWithOptions ensures every (shard, nodeIndex) pair has a ValkeyNode CR.
 // Each ValkeyNode manages exactly one Pod (Replicas=1) and is named
 // deterministically:
 //
@@ -519,7 +549,7 @@ func (r *ValkeyClusterReconciler) upsertService(ctx context.Context, cluster *va
 //	mycluster-0-0, mycluster-0-1, mycluster-0-2,
 //	mycluster-1-0, mycluster-1-1, mycluster-1-2,
 //	mycluster-2-0, mycluster-2-1, mycluster-2-2.
-func (r *ValkeyClusterReconciler) reconcileValkeyNodes(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, nodes *valkeyiov1alpha1.ValkeyNodeList, configHash string) (bool, error) {
+func (r *ValkeyClusterReconciler) reconcileValkeyNodesWithOptions(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, nodes *valkeyiov1alpha1.ValkeyNodeList, configHash string, options reconcileValkeyNodesOptions) (bool, error) {
 	log := logf.FromContext(ctx)
 
 	nodesPerShard := 1 + int(cluster.Spec.Replicas)
@@ -532,7 +562,7 @@ func (r *ValkeyClusterReconciler) reconcileValkeyNodes(ctx context.Context, clus
 	// primary last within each shard, and after an update we requeue
 	// immediately, re-scraping fresh state before any further rolls.
 	var clusterState *valkey.ClusterState
-	if anyNodeRequiresRoll(cluster, nodes, configHash) {
+	if options.AllowSpecUpdates && anyNodeRequiresRoll(cluster, nodes, configHash) {
 		operatorPassword, err := fetchSystemUserPassword(ctx, operatorUser, r.Client, cluster.Name, cluster.Namespace)
 		if err != nil {
 			return false, fmt.Errorf("failed to fetch operator password for proactive failover: %w", err)
@@ -554,7 +584,7 @@ func (r *ValkeyClusterReconciler) reconcileValkeyNodes(ctx context.Context, clus
 		// actual primary (which may differ from node-index=0 after a failover)
 		// and place it last.
 		for _, nodeIndex := range replicaFirstNodeOrder(shardIndex, nodesPerShard, nodes, clusterState) {
-			result, err := r.reconcileValkeyNode(ctx, cluster, shardIndex, nodeIndex, clusterState, configHash)
+			result, err := r.reconcileValkeyNodeWithOptions(ctx, cluster, shardIndex, nodeIndex, clusterState, configHash, options)
 			if err != nil {
 				return false, err
 			}
@@ -593,9 +623,10 @@ const (
 	nodeDeferred                    // primary roll deferred, waiting for synced replica
 )
 
-// reconcileValkeyNode reconciles a single ValkeyNode for (shardIndex, nodeIndex).
-// Returns a nodeResult signaling the outcome or required next action.
-func (r *ValkeyClusterReconciler) reconcileValkeyNode(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, shardIndex, nodeIndex int, clusterState *valkey.ClusterState, configHash string) (nodeResult, error) {
+// reconcileValkeyNodeWithOptions reconciles a single ValkeyNode for
+// (shardIndex, nodeIndex). Returns a nodeResult signaling the outcome or
+// required next action.
+func (r *ValkeyClusterReconciler) reconcileValkeyNodeWithOptions(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, shardIndex, nodeIndex int, clusterState *valkey.ClusterState, configHash string, options reconcileValkeyNodesOptions) (nodeResult, error) {
 	log := logf.FromContext(ctx)
 
 	desired := buildClusterValkeyNode(cluster, shardIndex, nodeIndex)
@@ -605,6 +636,18 @@ func (r *ValkeyClusterReconciler) reconcileValkeyNode(ctx context.Context, clust
 			Name:      desired.Name,
 			Namespace: desired.Namespace,
 		},
+	}
+
+	if !options.AllowSpecUpdates {
+		current := &valkeyiov1alpha1.ValkeyNode{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(node), current); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return nodeUnchanged, err
+			}
+		} else {
+			log.V(1).Info("active topology operation; skipping ValkeyNode spec update", "name", current.Name)
+			return settledValkeyNodeResult(ctx, current), nil
+		}
 	}
 
 	// Check if proactive failover is needed before updating.
@@ -664,29 +707,35 @@ func (r *ValkeyClusterReconciler) reconcileValkeyNode(ctx context.Context, clust
 		r.Recorder.Eventf(cluster, node, corev1.EventTypeNormal, "ValkeyNodeUpdated", "UpdateValkeyNode", "Updated ValkeyNode %s", node.Name)
 		return nodeRequeued, nil
 	case controllerutil.OperationResultNone:
-		if node.Status.ObservedGeneration > 0 && node.Generation != node.Status.ObservedGeneration {
-			log.V(1).Info("ValkeyNode spec not yet observed by controller, waiting",
-				"name", node.Name,
-				"generation", node.Generation,
-				"observedGeneration", node.Status.ObservedGeneration)
-			return nodeRequeued, nil
-		}
-		if !node.Status.Ready {
-			// No spec change, but the node hasn't reached Ready yet (e.g.
-			// still starting after a prior update). Unlike Updated above, we
-			// only wait when not-ready; a ready unchanged node is safe to
-			// advance past.
-			log.V(1).Info("ValkeyNode not yet ready, waiting", "name", node.Name)
-			return nodeRequeued, nil
-		}
-		if c := meta.FindStatusCondition(node.Status.Conditions, valkeyiov1alpha1.ValkeyNodeConditionLiveConfigApplied); c != nil && c.Status == metav1.ConditionFalse {
-			log.V(1).Info("ValkeyNode live config not yet applied, waiting", "name", node.Name)
-			return nodeRequeued, nil
-		}
+		return settledValkeyNodeResult(ctx, node), nil
 	default:
 		log.V(1).Info("unexpected CreateOrUpdate result", "result", result, "name", node.Name)
 	}
 	return nodeUnchanged, nil
+}
+
+func settledValkeyNodeResult(ctx context.Context, node *valkeyiov1alpha1.ValkeyNode) nodeResult {
+	log := logf.FromContext(ctx)
+	if node.Status.ObservedGeneration > 0 && node.Generation != node.Status.ObservedGeneration {
+		log.V(1).Info("ValkeyNode spec not yet observed by controller, waiting",
+			"name", node.Name,
+			"generation", node.Generation,
+			"observedGeneration", node.Status.ObservedGeneration)
+		return nodeRequeued
+	}
+	if !node.Status.Ready {
+		// No spec change, but the node hasn't reached Ready yet (e.g.
+		// still starting after a prior update). Unlike Updated above, we
+		// only wait when not-ready; a ready unchanged node is safe to
+		// advance past.
+		log.V(1).Info("ValkeyNode not yet ready, waiting", "name", node.Name)
+		return nodeRequeued
+	}
+	if c := meta.FindStatusCondition(node.Status.Conditions, valkeyiov1alpha1.ValkeyNodeConditionLiveConfigApplied); c != nil && c.Status == metav1.ConditionFalse {
+		log.V(1).Info("ValkeyNode live config not yet applied, waiting", "name", node.Name)
+		return nodeRequeued
+	}
+	return nodeUnchanged
 }
 
 const (
@@ -1215,6 +1264,7 @@ func (r *ValkeyClusterReconciler) updateStatus(ctx context.Context, cluster *val
 
 	// Apply conditions from the in-memory cluster object
 	current.Status.Conditions = cluster.Status.Conditions
+	current.Status.ActiveOperation = cluster.Status.ActiveOperation
 
 	// compute Valkey Cluster state from conditions (priority order: Degraded > Ready > Progressing > Failed)
 	readyCondition := meta.FindStatusCondition(current.Status.Conditions, valkeyiov1alpha1.ConditionReady)
@@ -1357,6 +1407,7 @@ func (r *ValkeyClusterReconciler) handleScaleIn(ctx context.Context, cluster *va
 		if err != nil {
 			log.Error(err, "scale-in draining failed")
 			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "DrainFailed", "ScaleIn", "Failed to drain excess shards: %v", err)
+			setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseDrainingSlots, "Rebalancing slots for scale-in")
 			setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonRebalanceFailed, err.Error(), metav1.ConditionTrue)
 			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Scaling in cluster", metav1.ConditionFalse)
 			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots for scale-in", metav1.ConditionTrue)
@@ -1365,6 +1416,7 @@ func (r *ValkeyClusterReconciler) handleScaleIn(ctx context.Context, cluster *va
 		}
 		if drained {
 			meta.RemoveStatusCondition(&cluster.Status.Conditions, valkeyiov1alpha1.ConditionDegraded)
+			setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseDrainingSlots, "Rebalancing slots for scale-in")
 			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Scaling in cluster", metav1.ConditionFalse)
 			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots for scale-in", metav1.ConditionTrue)
 			_ = r.updateStatus(ctx, cluster, state)
@@ -1378,6 +1430,8 @@ func (r *ValkeyClusterReconciler) handleScaleIn(ctx context.Context, cluster *va
 		log.Error(err, "failed to delete excess ValkeyNodes")
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, true
 	} else if deleted {
+		setActiveOperationPhase(cluster, valkeyiov1alpha1.OperationPhaseDrainingSlots, "Removing excess ValkeyNodes")
+		_ = r.updateStatus(ctx, cluster, state)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, true
 	}
 

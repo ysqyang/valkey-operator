@@ -250,6 +250,100 @@ type ExporterSpec struct {
 	SecurityContext *corev1.SecurityContext `json:"securityContext,omitempty"`
 }
 
+// OperationType identifies a long-running cluster mutation owned by the ValkeyCluster controller.
+// +kubebuilder:validation:Enum=ScaleOut;ScaleIn;RollingUpdate;Rebalance
+type OperationType string
+
+const (
+	// OperationScaleOut adds ValkeyNodes and joins them to the cluster topology.
+	OperationScaleOut OperationType = "ScaleOut"
+	// OperationScaleIn drains slots from excess shards and removes their ValkeyNodes.
+	OperationScaleIn OperationType = "ScaleIn"
+	// OperationRollingUpdate updates existing ValkeyNodes one at a time.
+	OperationRollingUpdate OperationType = "RollingUpdate"
+	// OperationRebalance moves slots between existing primaries.
+	OperationRebalance OperationType = "Rebalance"
+)
+
+// OperationPhase describes the current step of an active operation.
+// +kubebuilder:validation:Enum=Pending;CreatingNodes;JoiningNodes;AssigningSlots;AttachingReplicas;DrainingSlots;RebalancingSlots;RollingNodes
+type OperationPhase string
+
+const (
+	OperationPhasePending           OperationPhase = "Pending"
+	OperationPhaseCreatingNodes     OperationPhase = "CreatingNodes"
+	OperationPhaseJoiningNodes      OperationPhase = "JoiningNodes"
+	OperationPhaseAssigningSlots    OperationPhase = "AssigningSlots"
+	OperationPhaseAttachingReplicas OperationPhase = "AttachingReplicas"
+	OperationPhaseDrainingSlots     OperationPhase = "DrainingSlots"
+	OperationPhaseRebalancingSlots  OperationPhase = "RebalancingSlots"
+	OperationPhaseRollingNodes      OperationPhase = "RollingNodes"
+)
+
+// OperationSurface is a coarse-grained cluster surface owned by an active operation.
+// +kubebuilder:validation:Enum=Topology;Slots;PrimaryRole;PodRoll
+type OperationSurface string
+
+const (
+	OperationSurfaceTopology    OperationSurface = "Topology"
+	OperationSurfaceSlots       OperationSurface = "Slots"
+	OperationSurfacePrimaryRole OperationSurface = "PrimaryRole"
+	OperationSurfacePodRoll     OperationSurface = "PodRoll"
+)
+
+// ValkeyClusterOperationTarget captures the desired end state for an active operation.
+type ValkeyClusterOperationTarget struct {
+	// Shards is the desired shard count for topology operations.
+	// +optional
+	Shards int32 `json:"shards,omitempty"`
+
+	// Replicas is the desired replica count per shard for topology operations.
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// ConfigHash is the roll-relevant server config hash for rolling updates.
+	// +optional
+	ConfigHash string `json:"configHash,omitempty"`
+}
+
+// ValkeyClusterOperationStatus records the long-running mutation currently
+// owning cluster-wide Valkey topology, slot, primary-role, or pod-roll changes.
+type ValkeyClusterOperationStatus struct {
+	// Type identifies the active operation.
+	// +required
+	Type OperationType `json:"type"`
+
+	// Phase identifies the current step of the active operation.
+	// +required
+	Phase OperationPhase `json:"phase"`
+
+	// Generation is the ValkeyCluster metadata.generation that started or last
+	// retargeted this operation.
+	// +optional
+	Generation int64 `json:"generation,omitempty"`
+
+	// StartedAt is when this operation first acquired the cluster operation lock.
+	// +optional
+	StartedAt metav1.Time `json:"startedAt,omitempty"`
+
+	// UpdatedAt is when Type, Phase, Target, or Message was last changed.
+	// +optional
+	UpdatedAt metav1.Time `json:"updatedAt,omitempty"`
+
+	// Surfaces are the cluster mutation surfaces owned by this operation.
+	// +listType=set
+	// +optional
+	Surfaces []OperationSurface `json:"surfaces,omitempty"`
+
+	// Target captures the desired end state the operation is driving toward.
+	// +optional
+	Target ValkeyClusterOperationTarget `json:"target,omitempty"`
+
+	// Message provides human-readable details about the operation.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
 // ValkeyClusterStatus defines the observed state of ValkeyCluster.
 type ValkeyClusterStatus struct {
 	// State provides a high-level summary of the cluster's current state.
@@ -274,6 +368,11 @@ type ValkeyClusterStatus struct {
 	// +kubebuilder:default=0
 	// +optional
 	ReadyShards int32 `json:"readyShards,omitempty"`
+
+	// ActiveOperation records the long-running cluster mutation currently owning
+	// topology, slot, primary-role, or pod-roll changes.
+	// +optional
+	ActiveOperation *ValkeyClusterOperationStatus `json:"activeOperation,omitempty"`
 
 	// Conditions represent the current state of the ValkeyCluster resource.
 	// Standard condition types:
